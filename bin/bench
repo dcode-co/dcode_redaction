@@ -1,0 +1,63 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Two-payload throughput benchmark for DcodeRedaction.redact:
+#   1. benign  ~10KB of normal log text with no secrets (gate stays shut)
+#   2. adversarial ~10KB dense with URLs and token-lookalike words that open
+#      the gate on nearly every line (worst case for the per-pattern passes)
+#
+# Usage: bin/bench [iterations]  (default 3000)
+
+require_relative "../lib/dcode_redaction"
+require "benchmark"
+
+ITER = (ARGV[0] || 3000).to_i
+
+def pad_to(text, bytes)
+  out = +""
+  out << text << "\n" while out.bytesize < bytes
+  out.byteslice(0, bytes)
+end
+
+benign_line = "2026-07-17T10:00:00Z INFO request completed status=200 " \
+              "path=/users/1234/profile region=us-east-1 duration_ms=42 " \
+              "model=grok-3 cache=hit user_agent=ruby/3.4"
+benign = pad_to(benign_line, 10_240)
+
+# Token/URL lookalikes: words that trip the gate anchors (sk, AIza, mcp_, rnd_,
+# Bearer, token=, https://) without being full secrets, plus a couple of real
+# shapes, so the passes actually run over the whole payload.
+adversarial_line = [
+  "GET https://api.example.com/v1/resource?token=", "x" * 12,
+  "&code=abcd&page=2 ",
+  "task-deadbeefdeadbeef disk-0123456789 risk-assessment ",
+  "AIzawesome mcp_service rnd_pipeline Bearerish ",
+  "token: short secret: no api_key=", "y" * 4, " ",
+  "sk-", "A" * 24, " done"
+].join
+adversarial = pad_to(adversarial_line, 10_240)
+
+payloads = { "benign_10kb" => benign, "adversarial_10kb" => adversarial }
+
+puts "dcode_redaction bench  ruby=#{RUBY_VERSION}  iterations=#{ITER}"
+puts "-" * 68
+payloads.each do |label, payload|
+  DcodeRedaction.redact(payload) # warmup
+  gate = DcodeRedaction::Patterns::GATE.match?(payload)
+  elapsed = Benchmark.realtime { ITER.times { DcodeRedaction.redact(payload) } }
+  per_call_us = (elapsed / ITER) * 1_000_000
+  mb_per_s = (payload.bytesize * ITER) / elapsed / (1024.0 * 1024.0)
+  printf("%-18s size=%5dB gate=%-5s  %8.2f us/call  %8.1f MB/s\n",
+         label, payload.bytesize, gate.to_s, per_call_us, mb_per_s)
+end
+puts "-" * 68
+
+# Real-world context: log lines are usually short. The no-match gate scan is
+# proportional to input size, so per-line cost on typical logs is tiny.
+typical = benign_line # ~135 bytes, no secret
+DcodeRedaction.redact(typical)
+n = ITER * 20
+elapsed = Benchmark.realtime { n.times { DcodeRedaction.redact(typical) } }
+printf("typical_line       size=%5dB gate=false  %8.3f us/call  %8.0f lines/s\n",
+       typical.bytesize, (elapsed / n) * 1_000_000, n / elapsed)
+puts "-" * 68
